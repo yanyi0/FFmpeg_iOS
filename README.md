@@ -655,6 +655,7 @@ SDL通过回调的方式开启子线程播放音频
     [_glContext presentRenderbuffer:GL_RENDERBUFFER];
 }
 ```
+效果如下:
 ![0.gif](https://upload-images.jianshu.io/upload_images/4193251-391a26ddd3bc63a4.gif?imageMogr2/auto-orient/strip)
 
 ![1.gif](https://upload-images.jianshu.io/upload_images/4193251-8d746674ecb0a47d.gif?imageMogr2/auto-orient/strip)
