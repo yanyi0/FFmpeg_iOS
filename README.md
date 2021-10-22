@@ -1,4 +1,5 @@
-# iOS编译FFmpeg有两种方式
+#FFmpeg+fdk-aac+x264+sdl2编译，实现简单播放器
+## iOS编译FFmpeg有两种方式
 > 1.下载编译好的[FFmpeg静态库](https://sourceforge.net/projects/ffmpeg-ios/files/ffmpeg-ios-master.tar.bz2/download?use_mirror=versaweb)拖入Xcode工程中
 > 2.编译[ffmpeg源码](http://ffmpeg.org/download.html#releases)，可以更改源码，通过脚本编译自己的架构，更为灵活,包含fdk-aac库，x264,sdl2等。
 
