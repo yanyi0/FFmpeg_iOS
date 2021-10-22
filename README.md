@@ -656,9 +656,13 @@ SDL通过回调的方式开启子线程播放音频
 }
 ```
 ![0.gif](https://upload-images.jianshu.io/upload_images/4193251-391a26ddd3bc63a4.gif?imageMogr2/auto-orient/strip)
+
 ![1.gif](https://upload-images.jianshu.io/upload_images/4193251-8d746674ecb0a47d.gif?imageMogr2/auto-orient/strip)
+
 完整播放器Demo的github链接[FFmpeg_Player](https://github.com/yanyi0/FFmpeg_iOS.git)(百度网盘放一份，链接: https://pan.baidu.com/s/1ChXSBYW5REHWpCGys6bTmw 提取码: b4hg)
+
 ![图片.png](https://upload-images.jianshu.io/upload_images/4193251-b11b796b2bc47351.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+
 #8.编译fat binary,分别编译可跑模拟器版本i386,x86_64环境，SDL2使用Xcode进行编译,需要将胖二进制文件拖入Demo中,分别对fdk-aac,x264,sdl2,ffmpeg进行替换
 
 ![模拟器ffmpeg.gif](https://upload-images.jianshu.io/upload_images/4193251-510e031317b80064.gif?imageMogr2/auto-orient/strip)
