@@ -1,10 +1,14 @@
 # FFmpeg+fdk-aac+x264+sdl2编译，实现简单播放器
+
 > iOS编译FFmpeg有两种方式
+
 > 1.下载编译好的[FFmpeg静态库](https://sourceforge.net/projects/ffmpeg-ios/files/ffmpeg-ios-master.tar.bz2/download?use_mirror=versaweb)拖入Xcode工程中
 > 2.编译[ffmpeg源码](http://ffmpeg.org/download.html#releases)，可以更改源码，通过脚本编译自己的架构，更为灵活,包含fdk-aac库，x264,sdl2等。
 
 本文介绍自己编译sdl2，fdk-aac,x264，ffmpeg源码集成到Xcode工程中，其中fdk-aac，x264嵌套编译进ffmpeg中，并使用sdl播放音频，OPenGLES渲染视频实现简单播放器
+
 #1.编译SDL
+
 ##I.从[SDL官网](https://www.libsdl.org/download-2.0.php)下载SDL源码(百度网盘放一份[2.0.16])(链接:https://pan.baidu.com/s/11JeLkg82rdjnaBCD7q3_wg  密码:hv8j)
 ![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211016205902.jpg)
 ##II.解压后打开Xcode文件夹中的SDL.xcodeproj,选择静态库Static Library-iOS,Build选择Any iOS Devices(arm64,armv7)
