@@ -1,4 +1,3 @@
-# FFmpeg_iOS
 # iOS编译FFmpeg有两种方式
 > 1.下载编译好的[FFmpeg静态库](https://sourceforge.net/projects/ffmpeg-ios/files/ffmpeg-ios-master.tar.bz2/download?use_mirror=versaweb)拖入Xcode工程中
 > 2.编译[ffmpeg源码](http://ffmpeg.org/download.html#releases)，可以更改源码，通过脚本编译自己的架构，更为灵活,包含fdk-aac库，x264,sdl2等。
@@ -268,6 +267,397 @@ CONFIGURE_FLAGS="--enable-cross-compile --disable-debug --disable-programs \
 ```
 ##V.在当前目录下执行./build-ffmpeg.sh,编译完后生成FFmpeg-iOS文件夹，include中是头文件和lib中是静态库.a文件
 ![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017011429.jpg)
+
+#5.使用
+将编译好的sdl，fdk-aac,x264,ffmpeg头文件和库文件(include和lib文件夹)
+![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017013306.jpg)
+导入Xcode工程中并设置Header Search Path为
+```
+$(PROJECT_DIR)/FFmpeg_zero/FFmpeg-iOS/include
+$(PROJECT_DIR)/FFmpeg_zero/SDL/include
+$(PROJECT_DIR)/FFmpeg_zero/x264-iOS/include
+$(PROJECT_DIR)/FFmpeg_zero/fdk-aac-ios/include
+```
+![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017020341.jpg)
+导入依赖的库AVFoudation.framework,CoreMedia.framework,VideoToolBox.framework,AudioToolBox.framework,lbz.tbd,libbz2.tbd,libiconv.tbd
+![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017015332.jpg)
+使用ffmpeg库获取ffmpeg版本号
+![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017015035.jpg)
+
+#6.以上仅仅使用了ffmpeg，但没有使用sdl2,fdk-aac,x264,若使用还需导入UIKit.framework、Foundation.framework、CoreMotion.framework、MediaPlayer.framework、GameController.framework、CoreHaptics.framework，若使用OpenGL绘制视频帧，还需导入OpenGLES.framework、QuartzCore.framework。[Demo github地址](https://github.com/yanyi0/FFmpeg_iOS/tree/master/FFmpeg_zero)[链接: https://pan.baidu.com/s/1bcEYEyWFstmit2WSomSptA 提取码: 03os]
+集成后可使用ffmpeg进行软解码，sdl播放音频，OpenGLES绘制视频实现一个简单播放器
+
+#7.使用ffmpeg解码音视频,分为三步，解封装，解码视频，解码音频
+开启子线程读取到MP4文件后，从MP4文件中解封装出h264文件和aac文件分别解码为YUV原始视频帧和pcm原始音频,将解封装出来的h264文件放入_vPktList，aac文件放入_aPktList
+##I.ffmpeg解封装，解封装出视频文件和音频文件按序分裂存储到各自的list中
+```
+        //创建解封装上下文、打开文件
+        ret = avformat_open_input(&_fmtCtx,_filename,nullptr,nullptr);
+        END(avformat_open_input);
+        //检索流信息
+        ret = avformat_find_stream_info(_fmtCtx,nullptr);
+        END(avformat_find_stream_info);
+        //打印流信息到控制台
+        av_dump_format(_fmtCtx,0,_filename,0);
+        fflush(stderr);
+        //初始化音频信息
+        _hasAudio = initAudioInfo() >= 0;
+        //初始化视频信息
+        _hasVideo = initVideoInfo() >= 0;
+        if(!_hasAudio && !_hasVideo)
+        {
+            fataError();
+            return;
+        }
+        //初始化完毕，发送信号
+          initFinished(self);
+        //改变状态 要在读取线程的前面，否则导致解码循环提前退出，解码循环读取到时Stop状态直接break，再也不进入 无法解码 一直黑屏或没有声音，
+        //也可能SDL音频子线程一开始在Stopped，就退出了
+        setState(VideoPlayer::Playing);
+        //音频解码子线程开始工作:开始播放pcm
+        SDL_PauseAudio(0);
+        //视频解码子线程开始工作:开启新的线程去解码视频数据
+        std::thread([this](){
+            decodeVideo();
+        }).detach();
+        //从输入文件中读取数据
+        //确保每次读取到的pkt都是新的，在while循环外面，则每次加入list中的pkt都不会将一模一样，不为最后一次读取到的pkt，为全新的pkt，调用了拷贝构造函数
+        AVPacket pkt;
+        while(_state != Stopped){
+            //处理seek操作
+            if(_seekTime >= 0){
+                int streamIdx;
+                if(_hasAudio){//优先使用音频流索引
+                cout << "seek优先使用，音频流索引" << _aStream->index << endl;
+                  streamIdx = _aStream->index;
+                }else{
+                cout << "seek优先使用，视频流索引" << _vStream->index << endl;
+                  streamIdx = _vStream->index;
+                }
+                //现实时间 -> 时间戳
+                AVRational time_base = _fmtCtx->streams[streamIdx]->time_base;
+                int64_t ts = _seekTime/av_q2d(time_base);
+                ret = av_seek_frame(_fmtCtx,streamIdx,ts,AVSEEK_FLAG_BACKWARD);
+                if(ret < 0){//seek失败
+                    cout << "seek失败" << _seekTime << ts << streamIdx << endl;
+                    _seekTime = -1;
+                }else{//seek成功
+                    //记录seek到了哪一帧，有可能是P帧或B,会导致seek向前找到I帧，此时就会比实际seek的值要提前几帧，现象是调到seek的帧时会快速的闪现I帧到seek的帧
+                    //清空之前读取的数据包
+                    clearAudioPktList();
+                    clearVideoPktList();
+                    _vSeekTime = _seekTime;
+                    _aSeekTime = _seekTime;
+                    _seekTime = -1;
+                    //恢复时钟
+                    _aTime = 0;
+                    _vTime = 0;
+                }
+            }
+
+            int vSize = _vPktList.size();
+            int aSize = _aPktList.size();
+            //不要将文件中的压缩数据一次性读取到内存中，控制下大小
+            if(vSize >= VIDEO_MAX_PKT_SIZE || aSize >= AUDIO_MAX_PKT_SIZE){
+                continue;
+            }
+            ret = av_read_frame(_fmtCtx,&pkt);
+            if(ret == 0){
+                if(pkt.stream_index == _aStream->index){//读取到的是音频数据
+                    addAudioPkt(pkt);
+                }else if(pkt.stream_index == _vStream->index){//读取到的是视频数据
+                    addVideoPkt(pkt);
+                }else{//如果不是音频、视频流，直接释放，防止内存泄露
+                    av_packet_unref(&pkt);
+                }
+            }else if(ret == AVERROR_EOF){//读到了文件尾部
+                if(vSize == 0 && aSize == 0){
+                    //说明文件正常播放完毕
+                    _fmtCtxCanFree = true;
+                    break;
+                }
+                //读取到文件尾部依然要在while循环中转圈圈，若break跳出循环，则无法seek往回读了
+            }else{
+                ERROR_BUF;
+                cout << "av_read_frame error" << errbuf;
+                continue;
+            }
+        }
+        if(_fmtCtxCanFree){//正常读取到文件尾部
+            stop();
+        }else{
+            //标记一下:_fmtCtx可以释放了
+            _fmtCtxCanFree = true;
+        }
+```
+##II.解码音频，从_aPktList中取出一个一个的音频pkt进行解码，解码出pcm回调到SDL音频缓冲区进行播放,SDL支持的播放格式为s16le，此时需进行音频重采样，将fltp格式转为s16le格式，采样率由48000转为44100，双声道不变
+```
+int VideoPlayer::decodeAudio(){
+    _aMutex.lock();
+    //_aPktList中如果是空的，就进入等待，等待_aPktList中新加入解封装后的pkt发送信号signal通知到这儿，
+    //有可能解封装很快就都解完成了，后面都没有新的pkt，也不会发送信号了,就会一直在这儿等
+    if(_aPktList.empty()){
+        cout << "_aPktList为空" << _aPktList.size() << endl;
+        _aMutex.unlock();
+        return 0;
+    }
+    //取出list中的头部pkt
+    AVPacket &pkt = _aPktList.front();
+
+    //音频包应该在多少秒播放
+    if(pkt.pts != AV_NOPTS_VALUE){
+      _aTime = av_q2d(_aStream->time_base) * pkt.pts;
+      //通知外界:播放时间发生了改变
+        timeChanged(self);
+    }
+    //如果是视频，不能在这个位置判断(不能提前释放pkt,不然会导致B帧、P帧解码失败，画面撕裂)
+    //发现音频的时间是早于seekTime的，就丢弃，防止到seekTime的位置闪现
+    if(_aSeekTime >= 0){
+        if(_aTime < _aSeekTime){
+            //释放pkt
+            av_packet_unref(&pkt);
+            _aPktList.pop_front();
+             _aMutex.unlock();
+            return 0;
+        }else{
+            _aSeekTime = -1;
+        }
+    }
+    // 发送压缩数据到解码器
+    int ret = avcodec_send_packet(_aDecodeCtx, &pkt);
+    //释放pkt
+    av_packet_unref(&pkt);
+    //删除头部pkt,写成引用类型，不能立刻就从list中pop_front删掉这个pkt对象的内存，后面还会用到，用完之后才能删
+    _aPktList.pop_front();
+    _aMutex.unlock();
+    RET(avcodec_send_packet);
+    // 获取解码后的数据
+    ret = avcodec_receive_frame(_aDecodeCtx, _aSwrInFrame);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        return 0;
+    } else RET(avcodec_receive_frame);
+    //由于解码出来的pcm和SDL要求的pcm格式可能不一致，需要进行音频重采样
+    //重采样输出的样本数 向上取整  48000 1024 44100  outSamples
+    int outSamples = av_rescale_rnd(_aSwrOutSpec.sampleRate, _aSwrInFrame->nb_samples, _aSwrInSpec.sampleRate, AV_ROUND_UP);
+    // 重采样(返回值转换后的样本数量)_aSwrOutFrame->data必须初始化，否则重采样转化的pcm样本不知道放在那儿
+    ret = swr_convert(_aSwrCtx,_aSwrOutFrame->data, outSamples,(const uint8_t **) _aSwrInFrame->data, _aSwrInFrame->nb_samples);
+    RET(swr_convert);
+    //ret为每一个声道的样本数 * 声道数 * 每一个样本的大小 = 重采样后的pcm的大小
+    return  ret * _aSwrOutSpec.bytesPerSampleFrame;
+}
+```
+###III.解码视频，解码出原始的YUV420P视频文件，使用OpenGL进行渲染
+```
+    while (true) {
+        //如果是暂停状态,并且没有seek操作，暂停状态也能seek
+        if(_state == Paused && _vSeekTime == -1) continue;
+        //如果是停止状态，会调用free，就不用再去解码，重采样，渲染，导致访问释放了的内存空间，会闪退
+        if(_state == Stopped){
+            _vCanFree = true;
+            break;
+        }
+        _vMutex.lock();
+        if(_vPktList.empty()){
+            _vMutex.unlock();
+            continue;
+        }
+        //取出头部的视频包
+        AVPacket pkt = _vPktList.front();
+        _vPktList.pop_front();
+        _vMutex.unlock();
+        //发送数据到解码器
+        int ret = avcodec_send_packet(_vDecodeCtx,&pkt);
+        //视频时钟 视频用dts，音频用pts
+        if(pkt.dts != AV_NOPTS_VALUE){
+            _vTime = av_q2d(_vStream->time_base) * pkt.pts;
+        }
+        //释放pkt
+        av_packet_unref(&pkt);
+        CONTINUE(avcodec_send_packet);
+        while (true) {
+            //获取解码后的数据
+            ret = avcodec_receive_frame(_vDecodeCtx,_vSwsInFrame);
+            if(ret == AVERROR(EAGAIN) || ret == AVERROR_EOF){
+                break;//结束本次循环，重新从_vPktList取出包进行解码
+            }else BREAK(avcodec_receive_frame);
+
+            //一定要在解码成功后，再进行下面的判断,防止seek时，到达的是p帧，但前面的I帧已经被释放了，无法参考，这一帧的解码就会出现撕裂现象
+            //发现视频的时间是早于seekTime的，就丢弃，防止到seekTime的位置闪现
+            if(_vSeekTime >= 0){
+                if(_vTime < _vSeekTime){
+                    continue;
+                }else{
+                    _vSeekTime = -1;
+                }
+            }
+            //OPENGL渲染
+            char *buf = (char *)malloc(_vSwsInFrame->width * _vSwsInFrame->height * 3 / 2);
+            AVPicture *pict;
+            int w, h;
+            char *y, *u, *v;
+            pict = (AVPicture *)_vSwsInFrame;//这里的frame就是解码出来的AVFrame
+            w = _vSwsInFrame->width;
+            h = _vSwsInFrame->height;
+            y = buf;
+            u = y + w * h;
+            v = u + w * h / 4;
+            for (int i=0; i<h; i++)
+                memcpy(y + w * i, pict->data[0] + pict->linesize[0] * i, w);
+            for (int i=0; i<h/2; i++)
+                memcpy(u + w / 2 * i, pict->data[1] + pict->linesize[1] * i, w / 2);
+            for (int i=0; i<h/2; i++)
+                memcpy(v + w / 2 * i, pict->data[2] + pict->linesize[2] * i, w / 2);
+            if(_hasAudio){//有音频
+                //如果视频包多早解码出来，就要等待对应的音频时钟到达
+                //有可能点击停止的时候，正在循环里面，停止后sdl free掉了，就不会再从音频list中取出包，_aClock就不会增大，下面while就死循环了，一直出不来，所以加Playing判断
+                printf("vTime=%lf, aTime=%lf, vTime-aTime=%lf\n", _vTime, _aTime, _vTime - _aTime);
+                while(_vTime > _aTime && _state == Playing){
+                }
+            }else{
+                //没有音频的情况
+            }
+            //OPenGLES渲染
+            playerDoDraw(self,buf,_vSwsInFrame->width,_vSwsInFrame->height);
+            //若立即释放 会崩溃 原因是渲染并没有那么快，OPENGL还没有渲染完毕，但是这块内存已经被free掉了
+            //放到OPGLES glview中等待一帧渲染完毕后，再释放，此处不能释放
+        }
+    }
+```
+##IV.SDL播放pcm音频
+SDL通过回调的方式开启子线程播放音频
+![图片.png](https://upload-images.jianshu.io/upload_images/4193251-e083a5232fb318f1.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+```
+   //SDL缓冲区找解码器拉取符合播放格式的音频PCM流
+   //清零(静音处理)
+    SDL_memset(stream,0,len);
+   //len:SDL音频缓冲区剩余的大小(音频缓冲区还未填充的大小)
+    while (len > 0) {
+        //说明当前PCM的数据已经全部拷贝到SDL音频缓冲区了
+        //需要解码下一个pkt,获取新的PCM数据
+        if(_aSwrOutIdx >= _aSwrOutSize){
+            //全新PCM数据的大小
+            _aSwrOutSize = decodeAudio();
+            //索引清零
+            _aSwrOutIdx = 0;
+            //没有解码出PCM数据，那就静音处理
+            if(_aSwrOutSize <= 0){
+               //出错了，或者还没有解码出PCM数据，假定1024个字节静音处理
+                //假定1024个字节
+                _aSwrOutSize = 1024;
+                //给PCM填充0(静音)
+                memset(_aSwrOutFrame->data[0],0,_aSwrOutSize);
+            }
+        }
+        //本次需要填充到stream中的数据大小
+        int fillLen = _aSwrOutSize - _aSwrOutIdx;
+        fillLen = std::min(fillLen,len);
+        //获取音量
+        int volumn = _mute ? 0:(_volumn * 1.0/Max) * SDL_MIX_MAXVOLUME;
+        //将一个pkt包解码后的pcm数据填充到SDL的音频缓冲区
+        SDL_MixAudio(stream,_aSwrOutFrame->data[0]+_aSwrOutIdx,fillLen,volumn);
+        //移动偏移量
+        len -= fillLen;//SDL缓冲区剩余的大小
+        stream += fillLen;//stream的位置向后移动
+        _aSwrOutIdx += fillLen;//_aSwrOutIdx在_aSwrOutFrame->data[0]中的位置向后移动
+    }
+```
+##V.播放视频，通过OPENGL方式渲染原始YUV420P帧
+```
+- (void)displayYUV420pData:(void *)data width:(NSInteger)w height:(NSInteger)h
+{
+    //保存传递的yuv原始数据 render渲染完后释放free,能来到这儿，说明渲染下一帧(可能是第一帧)，先释放掉上一帧的数据data指向的内存空间，指针指向NULL
+    if(_pYuvData != NULL){
+        free(_pYuvData);
+        _pYuvData = NULL;
+    }
+    _pYuvData = data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @synchronized(self)
+        {
+            if (w != _videoW || h != _videoH)
+            {
+                [self setVideoSize:w height:h];
+            }
+            [EAGLContext setCurrentContext:_glContext];
+            
+            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXY]);
+            
+            //glTexSubImage2D (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels);
+            
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData);
+            
+            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXU]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w/2, h/2, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData + w * h);
+            
+            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXV]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w/2, h/2, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData + w * h * 5 / 4);
+            
+            [self render];
+        }
+    });
+    
+#ifdef DEBUG
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR)
+        {
+            printf("GL_ERROR=======>%d\n", err);
+        }
+        struct timeval nowtime;
+        gettimeofday(&nowtime, NULL);
+        if (nowtime.tv_sec != _time.tv_sec)
+        {
+            memcpy(&_time, &nowtime, sizeof(struct timeval));
+            _frameRate = 1;
+        }
+        else
+        {
+            _frameRate++;
+        }
+    });
+#endif
+}
+- (void)render
+{
+    [EAGLContext setCurrentContext:_glContext];
+    CGSize size = self.bounds.size;
+    glViewport(1, 1, size.width*_viewScale-2, size.height*_viewScale-2);
+    static const GLfloat squareVertices[] = {
+        -1.0f, -1.0f,
+        1.0f, -1.0f,
+        -1.0f,  1.0f,
+        1.0f,  1.0f,
+    };
+    
+    static const GLfloat coordVertices[] = {
+        0.0f, 1.0f,
+        1.0f, 1.0f,
+        0.0f,  0.0f,
+        1.0f,  0.0f,
+    };
+    
+    // Update attribute values
+    glVertexAttribPointer(ATTRIB_VERTEX, 2, GL_FLOAT, 0, 0, squareVertices);
+    glEnableVertexAttribArray(ATTRIB_VERTEX);
+    
+    glVertexAttribPointer(ATTRIB_TEXTURE, 2, GL_FLOAT, 0, 0, coordVertices);
+    glEnableVertexAttribArray(ATTRIB_TEXTURE); 
+    
+    // Draw
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindRenderbuffer(GL_RENDERBUFFER, _renderBuffer);
+    [_glContext presentRenderbuffer:GL_RENDERBUFFER];
+}
+```
+![0.gif](https://upload-images.jianshu.io/upload_images/4193251-391a26ddd3bc63a4.gif?imageMogr2/auto-orient/strip)
+![1.gif](https://upload-images.jianshu.io/upload_images/4193251-8d746674ecb0a47d.gif?imageMogr2/auto-orient/strip)
+完整播放器Demo的github链接[FFmpeg_Player](https://github.com/yanyi0/FFmpeg_iOS.git)(百度网盘放一份，链接: https://pan.baidu.com/s/1ChXSBYW5REHWpCGys6bTmw 提取码: b4hg)
+![图片.png](https://upload-images.jianshu.io/upload_images/4193251-b11b796b2bc47351.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
+#8.编译fat binary,分别编译可跑模拟器版本i386,x86_64环境，SDL2使用Xcode进行编译,需要将胖二进制文件拖入Demo中,分别对fdk-aac,x264,sdl2,ffmpeg进行替换
+
+![模拟器ffmpeg.gif](https://upload-images.jianshu.io/upload_images/4193251-510e031317b80064.gif?imageMogr2/auto-orient/strip)
+
 配置参数可精简和优化ffmpeg,在ffmpeg目录中，终端执行./configure --help列出全部参数
 ```
 Help options:
@@ -699,392 +1089,3 @@ Developer options (useful when working on FFmpeg itself):
 
 NOTE: Object files are built at the place where configure is launched.
 ```
-#5.使用
-将编译好的sdl，fdk-aac,x264,ffmpeg头文件和库文件(include和lib文件夹)
-![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017013306.jpg)
-导入Xcode工程中并设置Header Search Path为
-```
-$(PROJECT_DIR)/FFmpeg_zero/FFmpeg-iOS/include
-$(PROJECT_DIR)/FFmpeg_zero/SDL/include
-$(PROJECT_DIR)/FFmpeg_zero/x264-iOS/include
-$(PROJECT_DIR)/FFmpeg_zero/fdk-aac-ios/include
-```
-![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017020341.jpg)
-导入依赖的库AVFoudation.framework,CoreMedia.framework,VideoToolBox.framework,AudioToolBox.framework,lbz.tbd,libbz2.tbd,libiconv.tbd
-![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017015332.jpg)
-使用ffmpeg库获取ffmpeg版本号
-![](https://raw.githubusercontent.com/yanyi0/MWeb-Images/master/20211017015035.jpg)
-
-#6.以上仅仅使用了ffmpeg，但没有使用sdl2,fdk-aac,x264,若使用还需导入UIKit.framework、Foundation.framework、CoreMotion.framework、MediaPlayer.framework、GameController.framework、CoreHaptics.framework，若使用OpenGL绘制视频帧，还需导入OpenGLES.framework、QuartzCore.framework。[Demo github地址](https://github.com/yanyi0/FFmpeg_iOS/tree/master/FFmpeg_zero)[链接: https://pan.baidu.com/s/1bcEYEyWFstmit2WSomSptA 提取码: 03os]
-集成后可使用ffmpeg进行软解码，sdl播放音频，OpenGLES绘制视频实现一个简单播放器
-
-#7.使用ffmpeg解码音视频,分为三步，解封装，解码视频，解码音频
-开启子线程读取到MP4文件后，从MP4文件中解封装出h264文件和aac文件分别解码为YUV原始视频帧和pcm原始音频,将解封装出来的h264文件放入_vPktList，aac文件放入_aPktList
-##I.ffmpeg解封装，解封装出视频文件和音频文件按序分裂存储到各自的list中
-```
-        //创建解封装上下文、打开文件
-        ret = avformat_open_input(&_fmtCtx,_filename,nullptr,nullptr);
-        END(avformat_open_input);
-        //检索流信息
-        ret = avformat_find_stream_info(_fmtCtx,nullptr);
-        END(avformat_find_stream_info);
-        //打印流信息到控制台
-        av_dump_format(_fmtCtx,0,_filename,0);
-        fflush(stderr);
-        //初始化音频信息
-        _hasAudio = initAudioInfo() >= 0;
-        //初始化视频信息
-        _hasVideo = initVideoInfo() >= 0;
-        if(!_hasAudio && !_hasVideo)
-        {
-            fataError();
-            return;
-        }
-        //初始化完毕，发送信号
-          initFinished(self);
-        //改变状态 要在读取线程的前面，否则导致解码循环提前退出，解码循环读取到时Stop状态直接break，再也不进入 无法解码 一直黑屏或没有声音，
-        //也可能SDL音频子线程一开始在Stopped，就退出了
-        setState(VideoPlayer::Playing);
-        //音频解码子线程开始工作:开始播放pcm
-        SDL_PauseAudio(0);
-        //视频解码子线程开始工作:开启新的线程去解码视频数据
-        std::thread([this](){
-            decodeVideo();
-        }).detach();
-        //从输入文件中读取数据
-        //确保每次读取到的pkt都是新的，在while循环外面，则每次加入list中的pkt都不会将一模一样，不为最后一次读取到的pkt，为全新的pkt，调用了拷贝构造函数
-        AVPacket pkt;
-        while(_state != Stopped){
-            //处理seek操作
-            if(_seekTime >= 0){
-                int streamIdx;
-                if(_hasAudio){//优先使用音频流索引
-                cout << "seek优先使用，音频流索引" << _aStream->index << endl;
-                  streamIdx = _aStream->index;
-                }else{
-                cout << "seek优先使用，视频流索引" << _vStream->index << endl;
-                  streamIdx = _vStream->index;
-                }
-                //现实时间 -> 时间戳
-                AVRational time_base = _fmtCtx->streams[streamIdx]->time_base;
-                int64_t ts = _seekTime/av_q2d(time_base);
-                ret = av_seek_frame(_fmtCtx,streamIdx,ts,AVSEEK_FLAG_BACKWARD);
-                if(ret < 0){//seek失败
-                    cout << "seek失败" << _seekTime << ts << streamIdx << endl;
-                    _seekTime = -1;
-                }else{//seek成功
-                    //记录seek到了哪一帧，有可能是P帧或B,会导致seek向前找到I帧，此时就会比实际seek的值要提前几帧，现象是调到seek的帧时会快速的闪现I帧到seek的帧
-                    //清空之前读取的数据包
-                    clearAudioPktList();
-                    clearVideoPktList();
-                    _vSeekTime = _seekTime;
-                    _aSeekTime = _seekTime;
-                    _seekTime = -1;
-                    //恢复时钟
-                    _aTime = 0;
-                    _vTime = 0;
-                }
-            }
-
-            int vSize = _vPktList.size();
-            int aSize = _aPktList.size();
-            //不要将文件中的压缩数据一次性读取到内存中，控制下大小
-            if(vSize >= VIDEO_MAX_PKT_SIZE || aSize >= AUDIO_MAX_PKT_SIZE){
-                continue;
-            }
-            ret = av_read_frame(_fmtCtx,&pkt);
-            if(ret == 0){
-                if(pkt.stream_index == _aStream->index){//读取到的是音频数据
-                    addAudioPkt(pkt);
-                }else if(pkt.stream_index == _vStream->index){//读取到的是视频数据
-                    addVideoPkt(pkt);
-                }else{//如果不是音频、视频流，直接释放，防止内存泄露
-                    av_packet_unref(&pkt);
-                }
-            }else if(ret == AVERROR_EOF){//读到了文件尾部
-                if(vSize == 0 && aSize == 0){
-                    //说明文件正常播放完毕
-                    _fmtCtxCanFree = true;
-                    break;
-                }
-                //读取到文件尾部依然要在while循环中转圈圈，若break跳出循环，则无法seek往回读了
-            }else{
-                ERROR_BUF;
-                cout << "av_read_frame error" << errbuf;
-                continue;
-            }
-        }
-        if(_fmtCtxCanFree){//正常读取到文件尾部
-            stop();
-        }else{
-            //标记一下:_fmtCtx可以释放了
-            _fmtCtxCanFree = true;
-        }
-```
-##II.解码音频，从_aPktList中取出一个一个的音频pkt进行解码，解码出pcm回调到SDL音频缓冲区进行播放,SDL支持的播放格式为s16le，此时需进行音频重采样，将fltp格式转为s16le格式，采样率由48000转为44100，双声道不变
-```
-int VideoPlayer::decodeAudio(){
-    _aMutex.lock();
-    //_aPktList中如果是空的，就进入等待，等待_aPktList中新加入解封装后的pkt发送信号signal通知到这儿，
-    //有可能解封装很快就都解完成了，后面都没有新的pkt，也不会发送信号了,就会一直在这儿等
-    if(_aPktList.empty()){
-        cout << "_aPktList为空" << _aPktList.size() << endl;
-        _aMutex.unlock();
-        return 0;
-    }
-    //取出list中的头部pkt
-    AVPacket &pkt = _aPktList.front();
-
-    //音频包应该在多少秒播放
-    if(pkt.pts != AV_NOPTS_VALUE){
-      _aTime = av_q2d(_aStream->time_base) * pkt.pts;
-      //通知外界:播放时间发生了改变
-        timeChanged(self);
-    }
-    //如果是视频，不能在这个位置判断(不能提前释放pkt,不然会导致B帧、P帧解码失败，画面撕裂)
-    //发现音频的时间是早于seekTime的，就丢弃，防止到seekTime的位置闪现
-    if(_aSeekTime >= 0){
-        if(_aTime < _aSeekTime){
-            //释放pkt
-            av_packet_unref(&pkt);
-            _aPktList.pop_front();
-             _aMutex.unlock();
-            return 0;
-        }else{
-            _aSeekTime = -1;
-        }
-    }
-    // 发送压缩数据到解码器
-    int ret = avcodec_send_packet(_aDecodeCtx, &pkt);
-    //释放pkt
-    av_packet_unref(&pkt);
-    //删除头部pkt,写成引用类型，不能立刻就从list中pop_front删掉这个pkt对象的内存，后面还会用到，用完之后才能删
-    _aPktList.pop_front();
-    _aMutex.unlock();
-    RET(avcodec_send_packet);
-    // 获取解码后的数据
-    ret = avcodec_receive_frame(_aDecodeCtx, _aSwrInFrame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        return 0;
-    } else RET(avcodec_receive_frame);
-    //由于解码出来的pcm和SDL要求的pcm格式可能不一致，需要进行音频重采样
-    //重采样输出的样本数 向上取整  48000 1024 44100  outSamples
-    int outSamples = av_rescale_rnd(_aSwrOutSpec.sampleRate, _aSwrInFrame->nb_samples, _aSwrInSpec.sampleRate, AV_ROUND_UP);
-    // 重采样(返回值转换后的样本数量)_aSwrOutFrame->data必须初始化，否则重采样转化的pcm样本不知道放在那儿
-    ret = swr_convert(_aSwrCtx,_aSwrOutFrame->data, outSamples,(const uint8_t **) _aSwrInFrame->data, _aSwrInFrame->nb_samples);
-    RET(swr_convert);
-    //ret为每一个声道的样本数 * 声道数 * 每一个样本的大小 = 重采样后的pcm的大小
-    return  ret * _aSwrOutSpec.bytesPerSampleFrame;
-}
-```
-###III.解码视频，解码出原始的YUV420P视频文件，使用OpenGL进行渲染
-```
-    while (true) {
-        //如果是暂停状态,并且没有seek操作，暂停状态也能seek
-        if(_state == Paused && _vSeekTime == -1) continue;
-        //如果是停止状态，会调用free，就不用再去解码，重采样，渲染，导致访问释放了的内存空间，会闪退
-        if(_state == Stopped){
-            _vCanFree = true;
-            break;
-        }
-        _vMutex.lock();
-        if(_vPktList.empty()){
-            _vMutex.unlock();
-            continue;
-        }
-        //取出头部的视频包
-        AVPacket pkt = _vPktList.front();
-        _vPktList.pop_front();
-        _vMutex.unlock();
-        //发送数据到解码器
-        int ret = avcodec_send_packet(_vDecodeCtx,&pkt);
-        //视频时钟 视频用dts，音频用pts
-        if(pkt.dts != AV_NOPTS_VALUE){
-            _vTime = av_q2d(_vStream->time_base) * pkt.pts;
-        }
-        //释放pkt
-        av_packet_unref(&pkt);
-        CONTINUE(avcodec_send_packet);
-        while (true) {
-            //获取解码后的数据
-            ret = avcodec_receive_frame(_vDecodeCtx,_vSwsInFrame);
-            if(ret == AVERROR(EAGAIN) || ret == AVERROR_EOF){
-                break;//结束本次循环，重新从_vPktList取出包进行解码
-            }else BREAK(avcodec_receive_frame);
-
-            //一定要在解码成功后，再进行下面的判断,防止seek时，到达的是p帧，但前面的I帧已经被释放了，无法参考，这一帧的解码就会出现撕裂现象
-            //发现视频的时间是早于seekTime的，就丢弃，防止到seekTime的位置闪现
-            if(_vSeekTime >= 0){
-                if(_vTime < _vSeekTime){
-                    continue;
-                }else{
-                    _vSeekTime = -1;
-                }
-            }
-            //OPENGL渲染
-            char *buf = (char *)malloc(_vSwsInFrame->width * _vSwsInFrame->height * 3 / 2);
-            AVPicture *pict;
-            int w, h;
-            char *y, *u, *v;
-            pict = (AVPicture *)_vSwsInFrame;//这里的frame就是解码出来的AVFrame
-            w = _vSwsInFrame->width;
-            h = _vSwsInFrame->height;
-            y = buf;
-            u = y + w * h;
-            v = u + w * h / 4;
-            for (int i=0; i<h; i++)
-                memcpy(y + w * i, pict->data[0] + pict->linesize[0] * i, w);
-            for (int i=0; i<h/2; i++)
-                memcpy(u + w / 2 * i, pict->data[1] + pict->linesize[1] * i, w / 2);
-            for (int i=0; i<h/2; i++)
-                memcpy(v + w / 2 * i, pict->data[2] + pict->linesize[2] * i, w / 2);
-            if(_hasAudio){//有音频
-                //如果视频包多早解码出来，就要等待对应的音频时钟到达
-                //有可能点击停止的时候，正在循环里面，停止后sdl free掉了，就不会再从音频list中取出包，_aClock就不会增大，下面while就死循环了，一直出不来，所以加Playing判断
-                printf("vTime=%lf, aTime=%lf, vTime-aTime=%lf\n", _vTime, _aTime, _vTime - _aTime);
-                while(_vTime > _aTime && _state == Playing){
-                }
-            }else{
-                //没有音频的情况
-            }
-            //OPenGLES渲染
-            playerDoDraw(self,buf,_vSwsInFrame->width,_vSwsInFrame->height);
-            //若立即释放 会崩溃 原因是渲染并没有那么快，OPENGL还没有渲染完毕，但是这块内存已经被free掉了
-            //放到OPGLES glview中等待一帧渲染完毕后，再释放，此处不能释放
-        }
-    }
-```
-##IV.SDL播放pcm音频
-SDL通过回调的方式开启子线程播放音频
-![图片.png](https://upload-images.jianshu.io/upload_images/4193251-e083a5232fb318f1.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
-```
-   //SDL缓冲区找解码器拉取符合播放格式的音频PCM流
-   //清零(静音处理)
-    SDL_memset(stream,0,len);
-   //len:SDL音频缓冲区剩余的大小(音频缓冲区还未填充的大小)
-    while (len > 0) {
-        //说明当前PCM的数据已经全部拷贝到SDL音频缓冲区了
-        //需要解码下一个pkt,获取新的PCM数据
-        if(_aSwrOutIdx >= _aSwrOutSize){
-            //全新PCM数据的大小
-            _aSwrOutSize = decodeAudio();
-            //索引清零
-            _aSwrOutIdx = 0;
-            //没有解码出PCM数据，那就静音处理
-            if(_aSwrOutSize <= 0){
-               //出错了，或者还没有解码出PCM数据，假定1024个字节静音处理
-                //假定1024个字节
-                _aSwrOutSize = 1024;
-                //给PCM填充0(静音)
-                memset(_aSwrOutFrame->data[0],0,_aSwrOutSize);
-            }
-        }
-        //本次需要填充到stream中的数据大小
-        int fillLen = _aSwrOutSize - _aSwrOutIdx;
-        fillLen = std::min(fillLen,len);
-        //获取音量
-        int volumn = _mute ? 0:(_volumn * 1.0/Max) * SDL_MIX_MAXVOLUME;
-        //将一个pkt包解码后的pcm数据填充到SDL的音频缓冲区
-        SDL_MixAudio(stream,_aSwrOutFrame->data[0]+_aSwrOutIdx,fillLen,volumn);
-        //移动偏移量
-        len -= fillLen;//SDL缓冲区剩余的大小
-        stream += fillLen;//stream的位置向后移动
-        _aSwrOutIdx += fillLen;//_aSwrOutIdx在_aSwrOutFrame->data[0]中的位置向后移动
-    }
-```
-##V.播放视频，通过OPENGL方式渲染原始YUV420P帧
-```
-- (void)displayYUV420pData:(void *)data width:(NSInteger)w height:(NSInteger)h
-{
-    //保存传递的yuv原始数据 render渲染完后释放free,能来到这儿，说明渲染下一帧(可能是第一帧)，先释放掉上一帧的数据data指向的内存空间，指针指向NULL
-    if(_pYuvData != NULL){
-        free(_pYuvData);
-        _pYuvData = NULL;
-    }
-    _pYuvData = data;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @synchronized(self)
-        {
-            if (w != _videoW || h != _videoH)
-            {
-                [self setVideoSize:w height:h];
-            }
-            [EAGLContext setCurrentContext:_glContext];
-            
-            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXY]);
-            
-            //glTexSubImage2D (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels);
-            
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData);
-            
-            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXU]);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w/2, h/2, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData + w * h);
-            
-            glBindTexture(GL_TEXTURE_2D, _textureYUV[TEXV]);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w/2, h/2, GL_RED_EXT, GL_UNSIGNED_BYTE, _pYuvData + w * h * 5 / 4);
-            
-            [self render];
-        }
-    });
-    
-#ifdef DEBUG
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        GLenum err = glGetError();
-        if (err != GL_NO_ERROR)
-        {
-            printf("GL_ERROR=======>%d\n", err);
-        }
-        struct timeval nowtime;
-        gettimeofday(&nowtime, NULL);
-        if (nowtime.tv_sec != _time.tv_sec)
-        {
-            memcpy(&_time, &nowtime, sizeof(struct timeval));
-            _frameRate = 1;
-        }
-        else
-        {
-            _frameRate++;
-        }
-    });
-#endif
-}
-- (void)render
-{
-    [EAGLContext setCurrentContext:_glContext];
-    CGSize size = self.bounds.size;
-    glViewport(1, 1, size.width*_viewScale-2, size.height*_viewScale-2);
-    static const GLfloat squareVertices[] = {
-        -1.0f, -1.0f,
-        1.0f, -1.0f,
-        -1.0f,  1.0f,
-        1.0f,  1.0f,
-    };
-    
-    static const GLfloat coordVertices[] = {
-        0.0f, 1.0f,
-        1.0f, 1.0f,
-        0.0f,  0.0f,
-        1.0f,  0.0f,
-    };
-    
-    // Update attribute values
-    glVertexAttribPointer(ATTRIB_VERTEX, 2, GL_FLOAT, 0, 0, squareVertices);
-    glEnableVertexAttribArray(ATTRIB_VERTEX);
-    
-    glVertexAttribPointer(ATTRIB_TEXTURE, 2, GL_FLOAT, 0, 0, coordVertices);
-    glEnableVertexAttribArray(ATTRIB_TEXTURE); 
-    
-    // Draw
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glBindRenderbuffer(GL_RENDERBUFFER, _renderBuffer);
-    [_glContext presentRenderbuffer:GL_RENDERBUFFER];
-}
-```
-![0.gif](https://upload-images.jianshu.io/upload_images/4193251-391a26ddd3bc63a4.gif?imageMogr2/auto-orient/strip)
-![1.gif](https://upload-images.jianshu.io/upload_images/4193251-8d746674ecb0a47d.gif?imageMogr2/auto-orient/strip)
-完整播放器Demo的github链接[FFmpeg_Player](https://github.com/yanyi0/FFmpeg_iOS.git)(百度网盘放一份，链接: https://pan.baidu.com/s/1ChXSBYW5REHWpCGys6bTmw 提取码: b4hg)
-![图片.png](https://upload-images.jianshu.io/upload_images/4193251-b11b796b2bc47351.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1240)
-#8.编译fat binary,分别编译可跑模拟器版本i386,x86_64环境，SDL2使用Xcode进行编译,需要将胖二进制文件拖入Demo中,分别对fdk-aac,x264,sdl2,ffmpeg进行替换
-![模拟器ffmpeg.gif](https://upload-images.jianshu.io/upload_images/4193251-510e031317b80064.gif?imageMogr2/auto-orient/strip)
-
